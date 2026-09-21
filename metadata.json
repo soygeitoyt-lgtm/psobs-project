@@ -1,0 +1,6 @@
+{
+  "name": "OBS Audio Streamer",
+  "description": "Transmite audio en directo desde el micrófono de tu móvil hacia OBS Studio con baja latencia.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
