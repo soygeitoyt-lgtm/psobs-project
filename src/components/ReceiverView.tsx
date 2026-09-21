@@ -34,11 +34,7 @@ export function ReceiverView({
   const [widgetMode, setWidgetMode] = useState<'hud' | 'full' | 'stealth'>('hud');
   const [showInstructions, setShowInstructions] = useState(false);
   const [copiedLink, setCopiedLink] = useState(false);
-
-  const audioElRef = useRef<HTMLAudioElement | null>(null);
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
-  const animFrameRef = useRef<number | null>(null);
+  const [isPlayingTestTone, setIsPlayingTestTone] = useState(false);
 
   // WebRTC hook as receiver
   const {
@@ -56,7 +52,27 @@ export function ReceiverView({
     deviceName: 'OBS Studio Browser Source',
   });
 
-  // Attach remote stream to <audio> and Web Audio Analyser
+  const audioElRef = useRef<HTMLAudioElement | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const animFrameRef = useRef<number | null>(null);
+  const volumeRef = useRef<number>(volume);
+  const remoteMutedRef = useRef<boolean>(remoteMuted);
+
+  // Sync volume ref
+  useEffect(() => {
+    volumeRef.current = volume;
+    if (audioElRef.current) {
+      audioElRef.current.volume = volume;
+    }
+  }, [volume]);
+
+  // Sync mute ref
+  useEffect(() => {
+    remoteMutedRef.current = remoteMuted;
+  }, [remoteMuted]);
+
+  // Attach remote stream to <audio> and Web Audio Analyser for VU Meter
   useEffect(() => {
     if (!remoteStream) {
       if (audioElRef.current) {
@@ -69,16 +85,19 @@ export function ReceiverView({
     const audioEl = audioElRef.current;
     if (audioEl) {
       audioEl.srcObject = remoteStream;
-      audioEl.volume = volume;
-      audioEl
-        .play()
-        .then(() => {
-          setIsAudioContextBlocked(false);
-        })
-        .catch((err) => {
-          console.warn('Autoplay blocked by browser policy:', err);
-          setIsAudioContextBlocked(true);
-        });
+      audioEl.volume = volumeRef.current;
+      audioEl.muted = false;
+      const playPromise = audioEl.play();
+      if (playPromise !== undefined) {
+        playPromise
+          .then(() => {
+            setIsAudioContextBlocked(false);
+          })
+          .catch((err) => {
+            console.warn('Autoplay blocked by browser policy:', err);
+            setIsAudioContextBlocked(true);
+          });
+      }
     }
 
     // Set up AudioContext for VU meter visualization
@@ -90,10 +109,14 @@ export function ReceiverView({
       const ctx = new AudioContextClass();
       audioCtxRef.current = ctx;
 
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+
       const source = ctx.createMediaStreamSource(remoteStream);
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 256;
-      analyser.smoothingTimeConstant = 0.6;
+      analyser.smoothingTimeConstant = 0.5;
       analyserRef.current = analyser;
 
       source.connect(analyser);
@@ -109,7 +132,7 @@ export function ReceiverView({
         }
         const avg = sum / dataArray.length;
         const normalized = Math.min(100, Math.round((avg / 128) * 100));
-        setRemoteVolumeLevel(remoteMuted ? 0 : normalized);
+        setRemoteVolumeLevel(remoteMutedRef.current ? 0 : normalized);
 
         animFrameRef.current = requestAnimationFrame(updateMeter);
       };
@@ -122,30 +145,90 @@ export function ReceiverView({
     return () => {
       if (animFrameRef.current) {
         cancelAnimationFrame(animFrameRef.current);
+        animFrameRef.current = null;
       }
       if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') {
-        audioCtxRef.current.close();
+        audioCtxRef.current.close().catch(() => {});
+        audioCtxRef.current = null;
       }
     };
-  }, [remoteStream, remoteMuted, volume]);
+  }, [remoteStream]);
 
   // Volume slider update
   const handleVolumeChange = (newVol: number) => {
     setVolume(newVol);
-    if (audioElRef.current) {
-      audioElRef.current.volume = newVol;
-    }
   };
 
-  // Resume audio when user clicks manual play
+  // Resume audio when user clicks manual play or interacts with page
   const handleManualPlay = () => {
     if (audioElRef.current) {
       audioElRef.current.play().then(() => {
         setIsAudioContextBlocked(false);
-      });
+      }).catch(() => {});
     }
     if (audioCtxRef.current && audioCtxRef.current.state === 'suspended') {
-      audioCtxRef.current.resume();
+      audioCtxRef.current.resume().catch(() => {});
+    }
+  };
+
+  // Global user interaction listener to unblock audio in browsers
+  useEffect(() => {
+    const handleUnlock = () => {
+      if (audioElRef.current && audioElRef.current.srcObject && audioElRef.current.paused) {
+        audioElRef.current.play().then(() => setIsAudioContextBlocked(false)).catch(() => {});
+      }
+      if (audioCtxRef.current && audioCtxRef.current.state === 'suspended') {
+        audioCtxRef.current.resume().catch(() => {});
+      }
+    };
+
+    window.addEventListener('click', handleUnlock);
+    window.addEventListener('touchstart', handleUnlock);
+    window.addEventListener('keydown', handleUnlock);
+    return () => {
+      window.removeEventListener('click', handleUnlock);
+      window.removeEventListener('touchstart', handleUnlock);
+      window.removeEventListener('keydown', handleUnlock);
+    };
+  }, []);
+
+  // Audio test tone (useful for verifying OBS Audio Mixer is picking up browser sound)
+  const playTestTone = () => {
+    try {
+      const AudioContextClass =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      const ctx =
+        audioCtxRef.current && audioCtxRef.current.state !== 'closed'
+          ? audioCtxRef.current
+          : new AudioContextClass();
+
+      if (ctx.state === 'suspended') {
+        ctx.resume();
+      }
+
+      setIsPlayingTestTone(true);
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(587.33, ctx.currentTime);
+      osc.frequency.setValueAtTime(880.0, ctx.currentTime + 0.15);
+
+      gain.gain.setValueAtTime(0.25 * volumeRef.current, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.4);
+
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+
+      osc.start();
+      osc.stop(ctx.currentTime + 0.4);
+
+      setTimeout(() => {
+        setIsPlayingTestTone(false);
+      }, 450);
+    } catch (e) {
+      console.warn('Error playing test tone:', e);
+      setIsPlayingTestTone(false);
     }
   };
 
@@ -345,14 +428,27 @@ export function ReceiverView({
                 <span className="font-mono text-xs text-zinc-400">{Math.round(volume * 100)}%</span>
               </div>
 
-              <button
-                id="btn-reconnect-receiver"
-                onClick={reconnect}
-                className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-medium transition"
-              >
-                <RefreshCw className="w-3.5 h-3.5" />
-                <span>Reconectar</span>
-              </button>
+              <div className="flex items-center gap-1.5">
+                <button
+                  id="btn-test-sound-receiver"
+                  onClick={playTestTone}
+                  disabled={isPlayingTestTone}
+                  className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/30 text-xs font-medium transition"
+                  title="Reproduce un tono de prueba para confirmar que OBS recibe audio en su Mezclador"
+                >
+                  <Volume2 className={`w-3.5 h-3.5 ${isPlayingTestTone ? 'animate-bounce' : ''}`} />
+                  <span>{isPlayingTestTone ? 'Probando...' : 'Probar Audio'}</span>
+                </button>
+
+                <button
+                  id="btn-reconnect-receiver"
+                  onClick={reconnect}
+                  className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-medium transition"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>Reconectar</span>
+                </button>
+              </div>
             </div>
 
             {/* Quick Share / Link Box for OBS */}

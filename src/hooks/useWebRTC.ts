@@ -8,6 +8,7 @@ const ICE_SERVERS = [
   { urls: 'stun:stun2.l.google.com:19302' },
   { urls: 'stun:stun3.l.google.com:19302' },
   { urls: 'stun:stun4.l.google.com:19302' },
+  { urls: 'stun:stun.cloudflare.com:3478' },
 ];
 
 interface UseWebRTCOptions {
@@ -39,6 +40,7 @@ export function useWebRTC({
   const pingIntervalRef = useRef<number | null>(null);
   const localStreamRef = useRef<MediaStream | null>(localStream);
   const isMutedRef = useRef<boolean>(!!isMuted);
+  const isConnectingRef = useRef<boolean>(false);
 
   const sanitizedRoom = room.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '') || 'default';
   const receiverPeerId = `obsmic-recv-${sanitizedRoom}`;
@@ -47,7 +49,7 @@ export function useWebRTC({
   useEffect(() => {
     localStreamRef.current = localStream;
 
-    // Hot-replace track if audio stream changed during active call
+    // If active call exists, replace audio track seamlessly
     if (mediaCallRef.current && mediaCallRef.current.peerConnection) {
       const pc = mediaCallRef.current.peerConnection;
       const senders = pc.getSenders();
@@ -56,7 +58,7 @@ export function useWebRTC({
 
       if (audioSender && newTrack) {
         audioSender.replaceTrack(newTrack).catch((err) => {
-          console.warn('Error reemplazando pista de audio:', err);
+          console.warn('Error reemplazando pista en WebRTC:', err);
         });
       } else if (!audioSender && newTrack && localStream) {
         pc.addTrack(newTrack, localStream);
@@ -68,10 +70,14 @@ export function useWebRTC({
   useEffect(() => {
     isMutedRef.current = !!isMuted;
     if (dataConnRef.current && dataConnRef.current.open) {
-      dataConnRef.current.send({
-        type: 'mute-status',
-        isMuted: !!isMuted,
-      });
+      try {
+        dataConnRef.current.send({
+          type: 'mute-status',
+          isMuted: !!isMuted,
+        });
+      } catch {
+        // ignore
+      }
     }
   }, [isMuted]);
 
@@ -85,18 +91,30 @@ export function useWebRTC({
       return;
     }
 
-    // Close previous call if disconnected
+    // Guard: Never destroy or interrupt an already connected or connecting call
     if (mediaCallRef.current) {
-      try {
-        mediaCallRef.current.close();
-      } catch {
-        // ignore
+      const pc = mediaCallRef.current.peerConnection;
+      if (pc) {
+        const connState = pc.connectionState;
+        const iceState = pc.iceConnectionState;
+        if (
+          connState === 'connected' ||
+          iceState === 'connected' ||
+          iceState === 'completed'
+        ) {
+          // Already connected and streaming!
+          return;
+        }
       }
-      mediaCallRef.current = null;
+    }
+
+    if (isConnectingRef.current) {
+      return;
     }
 
     try {
-      setStatus('connecting-rtc');
+      isConnectingRef.current = true;
+      setStatus((prev) => (prev === 'connected' ? 'connected' : 'connecting-rtc'));
 
       // 1. Audio Media Call
       const call = peerRef.current.call(receiverPeerId, currentStream, {
@@ -108,70 +126,92 @@ export function useWebRTC({
       mediaCallRef.current = call;
 
       call.on('close', () => {
+        isConnectingRef.current = false;
+        mediaCallRef.current = null;
         setConnectedPeersCount(0);
         setStatus('waiting-peer');
-        mediaCallRef.current = null;
       });
 
       call.on('error', (err) => {
         console.warn('Media call error:', err);
+        isConnectingRef.current = false;
+        mediaCallRef.current = null;
+        setStatus('waiting-peer');
       });
+
+      const handleStateChange = () => {
+        const pc = call.peerConnection;
+        if (!pc) return;
+        const state = pc.connectionState;
+        const iceState = pc.iceConnectionState;
+
+        if (state === 'connected' || iceState === 'connected' || iceState === 'completed') {
+          isConnectingRef.current = false;
+          setStatus('connected');
+          setConnectedPeersCount(1);
+          setErrorMessage(null);
+        } else if (state === 'failed' || state === 'disconnected' || iceState === 'failed') {
+          isConnectingRef.current = false;
+          setStatus('waiting-peer');
+          setConnectedPeersCount(0);
+          mediaCallRef.current = null;
+        }
+      };
 
       if (call.peerConnection) {
-        call.peerConnection.onconnectionstatechange = () => {
-          const state = call.peerConnection.connectionState;
-          if (state === 'connected') {
-            setStatus('connected');
-            setConnectedPeersCount(1);
-            setErrorMessage(null);
-          } else if (state === 'disconnected' || state === 'failed') {
-            setStatus('waiting-peer');
-            setConnectedPeersCount(0);
+        call.peerConnection.onconnectionstatechange = handleStateChange;
+        call.peerConnection.oniceconnectionstatechange = handleStateChange;
+      } else {
+        setTimeout(() => {
+          if (call.peerConnection) {
+            call.peerConnection.onconnectionstatechange = handleStateChange;
+            call.peerConnection.oniceconnectionstatechange = handleStateChange;
           }
-        };
+        }, 150);
       }
 
-      // 2. Data Connection (for mute status, ping, etc.)
-      if (dataConnRef.current) {
+      // 2. Data Connection (independent channel for mute status & ping)
+      if (!dataConnRef.current || !dataConnRef.current.open) {
         try {
-          dataConnRef.current.close();
+          const conn = peerRef.current.connect(receiverPeerId, {
+            reliable: true,
+          });
+          dataConnRef.current = conn;
+
+          conn.on('open', () => {
+            conn.send({
+              type: 'mute-status',
+              isMuted: isMutedRef.current,
+            });
+          });
+
+          conn.on('data', (raw: unknown) => {
+            const data = raw as { type?: string; timestamp?: number };
+            if (data && data.type === 'pong' && data.timestamp) {
+              setPingLatency(Math.round(performance.now() - data.timestamp));
+            }
+          });
+
+          conn.on('close', () => {
+            dataConnRef.current = null;
+          });
+
+          conn.on('error', () => {
+            dataConnRef.current = null;
+          });
         } catch {
-          // ignore
+          // data connection error does not abort audio
         }
       }
-
-      const conn = peerRef.current.connect(receiverPeerId, {
-        reliable: true,
-      });
-      dataConnRef.current = conn;
-
-      conn.on('open', () => {
-        setStatus('connected');
-        setConnectedPeersCount(1);
-        conn.send({
-          type: 'mute-status',
-          isMuted: isMutedRef.current,
-        });
-      });
-
-      conn.on('data', (raw: unknown) => {
-        const data = raw as { type?: string; timestamp?: number };
-        if (data && data.type === 'pong' && data.timestamp) {
-          setPingLatency(Math.round(performance.now() - data.timestamp));
-        }
-      });
-
-      conn.on('close', () => {
-        dataConnRef.current = null;
-      });
     } catch (err) {
+      isConnectingRef.current = false;
       console.warn('Error calling receiver:', err);
     }
   }, [receiverPeerId, deviceName]);
 
   // Main Peer initialization
   const initPeer = useCallback(() => {
-    // Cleanup existing peer
+    // Cleanup existing intervals & connections
     if (retryIntervalRef.current) {
       clearInterval(retryIntervalRef.current);
       retryIntervalRef.current = null;
@@ -199,13 +239,14 @@ export function useWebRTC({
       peerRef.current = null;
     }
 
+    isConnectingRef.current = false;
     setStatus('connecting-ws');
     setErrorMessage(null);
 
     const peerId =
       role === 'receiver'
         ? receiverPeerId
-        : `obsmic-send-${sanitizedRoom}-${Math.random().toString(36).slice(2, 7)}`;
+        : `obsmic-send-${sanitizedRoom}-${Math.random().toString(36).slice(2, 8)}`;
 
     const peer = new Peer(peerId, {
       config: {
@@ -223,7 +264,7 @@ export function useWebRTC({
       }
     });
 
-    // RECEIVER logic
+    // RECEIVER logic (OBS Browser Source)
     if (role === 'receiver') {
       peer.on('call', (incomingCall) => {
         // Answer incoming audio stream from phone
@@ -241,18 +282,44 @@ export function useWebRTC({
           setRemoteStream(null);
           setConnectedPeersCount(0);
           setStatus('waiting-peer');
+          mediaCallRef.current = null;
         });
 
+        incomingCall.on('error', (err) => {
+          console.warn('Incoming call error:', err);
+          setRemoteStream(null);
+          setConnectedPeersCount(0);
+          setStatus('waiting-peer');
+          mediaCallRef.current = null;
+        });
+
+        const handleReceiverStateChange = () => {
+          const pc = incomingCall.peerConnection;
+          if (!pc) return;
+          const state = pc.connectionState;
+          const iceState = pc.iceConnectionState;
+
+          if (state === 'connected' || iceState === 'connected' || iceState === 'completed') {
+            setStatus('connected');
+            setConnectedPeersCount(1);
+          } else if (state === 'disconnected' || state === 'failed' || iceState === 'failed') {
+            setStatus('waiting-peer');
+            setConnectedPeersCount(0);
+            setRemoteStream(null);
+            mediaCallRef.current = null;
+          }
+        };
+
         if (incomingCall.peerConnection) {
-          incomingCall.peerConnection.onconnectionstatechange = () => {
-            const state = incomingCall.peerConnection.connectionState;
-            if (state === 'connected') {
-              setStatus('connected');
-            } else if (state === 'disconnected' || state === 'failed') {
-              setStatus('waiting-peer');
-              setConnectedPeersCount(0);
+          incomingCall.peerConnection.onconnectionstatechange = handleReceiverStateChange;
+          incomingCall.peerConnection.oniceconnectionstatechange = handleReceiverStateChange;
+        } else {
+          setTimeout(() => {
+            if (incomingCall.peerConnection) {
+              incomingCall.peerConnection.onconnectionstatechange = handleReceiverStateChange;
+              incomingCall.peerConnection.oniceconnectionstatechange = handleReceiverStateChange;
             }
-          };
+          }, 150);
         }
       });
 
@@ -276,22 +343,30 @@ export function useWebRTC({
       });
     }
 
-    // Handle errors (e.g., peer unavailable while receiver hasn't opened yet)
+    // Handle Peer errors
     peer.on('error', (err: { type?: string; message?: string }) => {
       if (err.type === 'peer-unavailable') {
-        // Expected when OBS is not yet opened on PC
+        // OBS source is not yet open on PC
+        isConnectingRef.current = false;
         setStatus('waiting-peer');
       } else if (err.type === 'unavailable-id') {
-        // If an old receiver instance was hanging on this ID, retry after slight delay
-        setErrorMessage('La sala ya tiene un receptor activo. Reconectando...');
+        // If a previous instance of OBS held the ID during reload, wait and retry
+        setErrorMessage('La sala se está conectando en el servidor... Reconectando...');
+        setStatus('connecting-ws');
         setTimeout(() => {
-          if (peerRef.current && !peerRef.current.destroyed) {
-            initPeer();
+          if (peerRef.current) {
+            try {
+              peerRef.current.destroy();
+            } catch {}
+            peerRef.current = null;
           }
-        }, 3000);
+          initPeer();
+        }, 2000);
       } else {
-        console.warn('PeerJS error:', err);
-        setErrorMessage(err.message || 'Error de conexión P2P');
+        console.warn('PeerJS notice:', err);
+        if (err.message && !err.message.includes('Could not connect')) {
+          setErrorMessage(err.message);
+        }
       }
     });
 
@@ -302,30 +377,36 @@ export function useWebRTC({
       } catch {}
     });
 
-    // Start latency ping interval for sender
+    // Start intervals on sender
     if (role === 'sender') {
+      // Periodic ping for latency display
       pingIntervalRef.current = window.setInterval(() => {
         if (dataConnRef.current && dataConnRef.current.open) {
-          dataConnRef.current.send({
-            type: 'ping',
-            timestamp: performance.now(),
-          });
+          try {
+            dataConnRef.current.send({
+              type: 'ping',
+              timestamp: performance.now(),
+            });
+          } catch {}
         }
       }, 5000);
 
-      // Auto-retry calling OBS receiver periodically if capturing and not yet connected
+      // Safe auto-retry: ONLY retry if there is NO active connected call
       retryIntervalRef.current = window.setInterval(() => {
         if (
           localStreamRef.current &&
-          (!mediaCallRef.current || !dataConnRef.current || !dataConnRef.current.open)
+          !isConnectingRef.current &&
+          (!mediaCallRef.current ||
+            mediaCallRef.current.peerConnection?.connectionState === 'failed' ||
+            mediaCallRef.current.peerConnection?.connectionState === 'disconnected')
         ) {
           callReceiver();
         }
-      }, 3000);
+      }, 3500);
     }
   }, [role, receiverPeerId, sanitizedRoom, callReceiver]);
 
-  // When local stream becomes available (or changes) on sender, trigger call
+  // When local stream becomes available on sender, trigger call if not connected
   useEffect(() => {
     if (role === 'sender' && localStream) {
       callReceiver();
@@ -336,7 +417,15 @@ export function useWebRTC({
   useEffect(() => {
     initPeer();
 
+    const handleBeforeUnload = () => {
+      try {
+        if (peerRef.current) peerRef.current.destroy();
+      } catch {}
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+
     return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
       if (retryIntervalRef.current) clearInterval(retryIntervalRef.current);
       if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
       if (mediaCallRef.current) {

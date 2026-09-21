@@ -107,12 +107,12 @@ export function useAudioCapture() {
 
       const constraints: MediaStreamConstraints = {
         audio: {
-          deviceId: settings.deviceId ? { exact: settings.deviceId } : undefined,
-          echoCancellation: settings.echoCancellation,
-          noiseSuppression: settings.noiseSuppression,
-          autoGainControl: settings.autoGainControl,
-          sampleRate: 48000,
-          channelCount: settings.stereo ? 2 : 1,
+          deviceId: settings.deviceId ? { ideal: settings.deviceId } : undefined,
+          echoCancellation: { ideal: settings.echoCancellation },
+          noiseSuppression: { ideal: settings.noiseSuppression },
+          autoGainControl: { ideal: settings.autoGainControl },
+          sampleRate: { ideal: 48000 },
+          channelCount: { ideal: settings.stereo ? 2 : 1 },
         },
         video: false,
       };
@@ -121,13 +121,26 @@ export function useAudioCapture() {
       rawStreamRef.current = rawStream;
       setPermissionState('granted');
 
+      // Ensure tracks match initial mute state
+      rawStream.getAudioTracks().forEach((track) => {
+        track.enabled = !isMuted;
+      });
+
       // Update device labels if they were blank before permission
       refreshDevices();
 
-      // Create Web Audio processing pipeline
-      const AudioContextClass = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      const ctx = new AudioContextClass({ sampleRate: 48000 });
+      // Create Web Audio processing pipeline for VU meter
+      const AudioContextClass =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext })
+          .webkitAudioContext;
+      const ctx = new AudioContextClass();
       audioContextRef.current = ctx;
+
+      // On mobile browsers, AudioContext starts suspended until resumed explicitly
+      if (ctx.state === 'suspended') {
+        await ctx.resume().catch(() => {});
+      }
 
       const source = ctx.createMediaStreamSource(rawStream);
       sourceNodeRef.current = source;
@@ -141,27 +154,21 @@ export function useAudioCapture() {
       analyser.smoothingTimeConstant = 0.6;
       analyserNodeRef.current = analyser;
 
+      // Connect source to gain and analyser for VU meter
+      source.connect(gain);
+      gain.connect(analyser);
+
       // Local monitor node (connected to speakers/headphones if testLocally is on)
       const monitorGain = ctx.createGain();
       monitorGain.gain.value = testLocally ? 1.0 : 0.0;
       localMonitorNodeRef.current = monitorGain;
-
-      // Processed stream for WebRTC destination
-      const destination = ctx.createMediaStreamDestination();
-      destinationNodeRef.current = destination;
-
-      // Route: Source -> Gain -> Analyser -> Destination (to WebRTC)
-      source.connect(gain);
-      gain.connect(analyser);
-      gain.connect(destination);
-
-      // Route for local audio monitoring (optional)
       gain.connect(monitorGain);
       monitorGain.connect(ctx.destination);
 
-      const processedStream = destination.stream;
-      processedStreamRef.current = processedStream;
-      setStream(processedStream);
+      // We transmit the native rawStream directly over WebRTC.
+      // This ensures 100% hardware audio transmission with zero AudioContext suspension dropouts.
+      processedStreamRef.current = rawStream;
+      setStream(rawStream);
       setIsCapturing(true);
 
       // Start volume level loop
@@ -183,7 +190,7 @@ export function useAudioCapture() {
       };
       animFrameRef.current = requestAnimationFrame(updateVolume);
 
-      return processedStream;
+      return rawStream;
     } catch (err: unknown) {
       console.error('Error al acceder al micrófono:', err);
       const msg =
@@ -226,6 +233,11 @@ export function useAudioCapture() {
   const toggleMute = useCallback(() => {
     setIsMuted((prev) => {
       const next = !prev;
+      if (rawStreamRef.current) {
+        rawStreamRef.current.getAudioTracks().forEach((track) => {
+          track.enabled = !next;
+        });
+      }
       if (gainNodeRef.current && audioContextRef.current) {
         gainNodeRef.current.gain.setTargetAtTime(
           next ? 0 : settings.gain,

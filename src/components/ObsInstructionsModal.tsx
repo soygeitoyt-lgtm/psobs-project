@@ -80,7 +80,7 @@ export function ObsInstructionsModal({ isOpen, onClose, obsUrl }: ObsInstruction
             <div className="space-y-1">
               <p className="font-semibold text-white">Configura el audio en OBS</p>
               <p className="text-zinc-400 leading-normal">
-                Marca la casilla <span className="text-zinc-200 font-semibold">"Controlar audio mediante OBS"</span> si deseas ver la barra de volumen en el Mezclador de Audio de OBS y aplicarle filtros (compresor, puerta de ruido, ganancia).
+                Marca la casilla <span className="text-zinc-200 font-semibold">"Controlar audio mediante OBS"</span> para que aparezca en el <span className="text-emerald-400 font-semibold">Mezclador de Audio</span> de OBS con su fader de volumen y filtros.
               </p>
             </div>
           </div>
@@ -91,9 +91,22 @@ export function ObsInstructionsModal({ isOpen, onClose, obsUrl }: ObsInstruction
               4
             </div>
             <div className="space-y-1">
+              <p className="font-semibold text-white">¿Quieres escucharte a ti mismo con auriculares?</p>
+              <p className="text-zinc-400 leading-normal">
+                En el <span className="text-zinc-200 font-semibold">Mezclador de Audio</span> de OBS, haz clic en los 3 puntos (o engranaje) ➔ <span className="text-zinc-200 font-semibold">Propiedades de audio avanzadas</span> ➔ en tu fuente de Navegador cambia a <span className="text-emerald-400 font-semibold">"Monitorización y emisión"</span>.
+              </p>
+            </div>
+          </div>
+
+          {/* Step 5 */}
+          <div className="flex gap-3 p-3 bg-zinc-950/60 border border-zinc-800/80 rounded-xl">
+            <div className="flex-shrink-0 w-6 h-6 rounded-full bg-emerald-500/20 text-emerald-400 flex items-center justify-center font-bold text-xs">
+              5
+            </div>
+            <div className="space-y-1">
               <p className="font-semibold text-white">Dimensiones recomendadas</p>
               <p className="text-zinc-400 leading-normal">
-                Si deseas usar el widget visual de micrófono en tu pantalla, ajusta el <span className="text-zinc-200 font-semibold">Ancho: 400</span> y <span className="text-zinc-200 font-semibold">Alto: 120</span>. Si solo quieres el audio, puedes colocar 1x1 o esconder la fuente detrás de otras capas.
+                Si deseas usar el widget visual en pantalla, ajusta <span className="text-zinc-200 font-semibold">Ancho: 400</span> y <span className="text-zinc-200 font-semibold">Alto: 120</span>. Si solo quieres el audio invisible, usa el modo "Invisible (Audio Puro)" o colócala al fondo.
               </p>
             </div>
           </div>
