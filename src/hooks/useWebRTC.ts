@@ -2,13 +2,24 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { Peer, MediaConnection, DataConnection } from 'peerjs';
 import { AppRole, ConnectionStatus } from '../types';
 
-const ICE_SERVERS = [
+const ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
   { urls: 'stun:stun2.l.google.com:19302' },
   { urls: 'stun:stun3.l.google.com:19302' },
   { urls: 'stun:stun4.l.google.com:19302' },
   { urls: 'stun:stun.cloudflare.com:3478' },
+  // Relay TURN: imprescindible cuando el celular usa datos móviles
+  // o hay NAT estricto. Sin relay, STUN solo falla en esas redes.
+  {
+    urls: [
+      'turn:openrelay.metered.ca:80',
+      'turn:openrelay.metered.ca:443',
+      'turns:openrelay.metered.ca:443',
+    ],
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  },
 ];
 
 interface UseWebRTCOptions {
@@ -43,7 +54,15 @@ export function useWebRTC({
   const isConnectingRef = useRef<boolean>(false);
 
   const sanitizedRoom = room.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '') || 'default';
-  const receiverPeerId = `obsmic-recv-${sanitizedRoom}`;
+  // Token único por sala (en la URL) para que la ID del receptor no choque
+  // con la de otros usuarios en PeerJS Cloud (IDs globales compartidas).
+  const urlToken =
+    new URLSearchParams(window.location.search)
+      .get('token')
+      ?.trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]/g, '') || '';
+  const receiverPeerId = `psobs-recv-${urlToken || sanitizedRoom}`;
 
   // Keep localStreamRef synced
   useEffect(() => {
@@ -91,7 +110,7 @@ export function useWebRTC({
       return;
     }
 
-    // Guard: Never destroy or interrupt an already connected or connecting call
+    // Guard: si ya hay una llamada en curso (conectando o conectada), no duplicar
     if (mediaCallRef.current) {
       const pc = mediaCallRef.current.peerConnection;
       if (pc) {
@@ -99,10 +118,13 @@ export function useWebRTC({
         const iceState = pc.iceConnectionState;
         if (
           connState === 'connected' ||
+          connState === 'connecting' ||
+          connState === 'new' ||
           iceState === 'connected' ||
-          iceState === 'completed'
+          iceState === 'completed' ||
+          iceState === 'checking'
         ) {
-          // Already connected and streaming!
+          // Ya hay una llamada activa o en proceso: no crear otra
           return;
         }
       }
@@ -110,6 +132,15 @@ export function useWebRTC({
 
     if (isConnectingRef.current) {
       return;
+    }
+
+    // Cerrar una llamada previa muerta/fallida antes de crear la nueva
+    if (mediaCallRef.current) {
+      const oldCall = mediaCallRef.current;
+      mediaCallRef.current = null;
+      try {
+        oldCall.close();
+      } catch {}
     }
 
     try {
@@ -127,7 +158,10 @@ export function useWebRTC({
 
       call.on('close', () => {
         isConnectingRef.current = false;
-        mediaCallRef.current = null;
+        // Solo limpiar la ref si esta llamada sigue siendo la actual
+        if (mediaCallRef.current === call) {
+          mediaCallRef.current = null;
+        }
         setConnectedPeersCount(0);
         setStatus('waiting-peer');
       });
@@ -135,7 +169,9 @@ export function useWebRTC({
       call.on('error', (err) => {
         console.warn('Media call error:', err);
         isConnectingRef.current = false;
-        mediaCallRef.current = null;
+        if (mediaCallRef.current === call) {
+          mediaCallRef.current = null;
+        }
         setStatus('waiting-peer');
       });
 
@@ -150,12 +186,16 @@ export function useWebRTC({
           setStatus('connected');
           setConnectedPeersCount(1);
           setErrorMessage(null);
-        } else if (state === 'failed' || state === 'disconnected' || iceState === 'failed') {
+        } else if (state === 'failed' || state === 'closed' || iceState === 'failed') {
+          // Solo fatal: cerramos y dejamos que el reintento haga su trabajo
           isConnectingRef.current = false;
           setStatus('waiting-peer');
           setConnectedPeersCount(0);
-          mediaCallRef.current = null;
+          if (mediaCallRef.current === call) {
+            mediaCallRef.current = null;
+          }
         }
+        // 'disconnected' transitorio: NO tumbar la llamada (evita el loop reconectar-caer)
       };
 
       if (call.peerConnection) {
@@ -279,18 +319,22 @@ export function useWebRTC({
         });
 
         incomingCall.on('close', () => {
+          if (mediaCallRef.current === incomingCall) {
+            mediaCallRef.current = null;
+          }
           setRemoteStream(null);
           setConnectedPeersCount(0);
           setStatus('waiting-peer');
-          mediaCallRef.current = null;
         });
 
         incomingCall.on('error', (err) => {
           console.warn('Incoming call error:', err);
+          if (mediaCallRef.current === incomingCall) {
+            mediaCallRef.current = null;
+          }
           setRemoteStream(null);
           setConnectedPeersCount(0);
           setStatus('waiting-peer');
-          mediaCallRef.current = null;
         });
 
         const handleReceiverStateChange = () => {
@@ -302,12 +346,17 @@ export function useWebRTC({
           if (state === 'connected' || iceState === 'connected' || iceState === 'completed') {
             setStatus('connected');
             setConnectedPeersCount(1);
-          } else if (state === 'disconnected' || state === 'failed' || iceState === 'failed') {
+            setErrorMessage(null);
+          } else if (state === 'failed' || state === 'closed' || iceState === 'failed') {
+            // Solo fatal
             setStatus('waiting-peer');
             setConnectedPeersCount(0);
             setRemoteStream(null);
-            mediaCallRef.current = null;
+            if (mediaCallRef.current === incomingCall) {
+              mediaCallRef.current = null;
+            }
           }
+          // 'disconnected' transitorio: conservar la llamada y el audio
         };
 
         if (incomingCall.peerConnection) {
@@ -391,15 +440,17 @@ export function useWebRTC({
         }
       }, 5000);
 
-      // Safe auto-retry: ONLY retry if there is NO active connected call
+      // Safe auto-retry: ONLY retry if there is NO active call or it's truly
+      // failed/closed (not transient 'disconnected', that would cause a loop)
       retryIntervalRef.current = window.setInterval(() => {
-        if (
-          localStreamRef.current &&
-          !isConnectingRef.current &&
-          (!mediaCallRef.current ||
-            mediaCallRef.current.peerConnection?.connectionState === 'failed' ||
-            mediaCallRef.current.peerConnection?.connectionState === 'disconnected')
-        ) {
+        if (!localStreamRef.current || isConnectingRef.current) return;
+
+        const activeCall = mediaCallRef.current;
+        const callState = activeCall?.peerConnection?.connectionState;
+        const needsRetry =
+          !activeCall || callState === 'failed' || callState === 'closed';
+
+        if (needsRetry) {
           callReceiver();
         }
       }, 3500);
@@ -449,6 +500,17 @@ export function useWebRTC({
   const reconnect = useCallback(() => {
     initPeer();
   }, [initPeer]);
+
+  // Aviso si WebRTC queda atascado en connecting-rtc (posible bloqueo de NAT)
+  useEffect(() => {
+    if (role !== 'sender' || status !== 'connecting-rtc') return;
+    const t = window.setTimeout(() => {
+      setErrorMessage(
+        'No se pudo completar la conexión directa (NAT). Si el celular está en datos móviles, conecta ambos a la misma WiFi o usa un servidor TURN.'
+      );
+    }, 25000);
+    return () => window.clearTimeout(t);
+  }, [status, role]);
 
   return {
     status,

@@ -14,16 +14,22 @@ function generateRandomRoomId(): string {
   return `mic-${num}`;
 }
 
+function generateToken(): string {
+  return Math.random().toString(36).slice(2, 8);
+}
+
 export default function App() {
   const [role, setRole] = useState<AppRole>('sender');
   const [room, setRoom] = useState<string>('');
+  const [roomToken, setRoomToken] = useState<string>('');
   const [isObsEmbedded, setIsObsEmbedded] = useState(false);
 
-  // Initialize room and role from URL params
+  // Initialize room, token and role from URL params
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const urlRole = params.get('role');
     const urlRoom = params.get('room');
+    const urlToken = params.get('token');
 
     if (urlRole === 'obs' || urlRole === 'receiver') {
       setRole('receiver');
@@ -32,16 +38,26 @@ export default function App() {
       setRole('sender');
     }
 
+    // Token único por sala (evita choques de ID en PeerJS Cloud)
+    const cleanToken = (urlToken || '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '');
+    const token = cleanToken || generateToken();
+    setRoomToken(token);
+    params.set('token', token);
+
     if (urlRoom) {
       setRoom(urlRoom.trim().toLowerCase());
     } else {
       const generated = generateRandomRoomId();
       setRoom(generated);
-      // Sync URL
-      const newParams = new URLSearchParams(window.location.search);
-      newParams.set('room', generated);
-      window.history.replaceState(null, '', `?${newParams.toString()}`);
+      params.set('room', generated);
     }
+
+    // Sync URL (token + room y role)
+    const synced = new URLSearchParams();
+    synced.set('room', params.get('room')!);
+    synced.set('token', token);
+    if (role === 'receiver') synced.set('role', 'obs');
+    window.history.replaceState(null, '', `?${synced.toString()}`);
   }, []);
 
   const handleRoleChange = (newRole: AppRole) => {
@@ -49,6 +65,7 @@ export default function App() {
     const params = new URLSearchParams(window.location.search);
     params.set('role', newRole === 'receiver' ? 'obs' : 'sender');
     if (room) params.set('room', room);
+    if (roomToken) params.set('token', roomToken);
     window.history.replaceState(null, '', `?${params.toString()}`);
   };
 
@@ -56,6 +73,7 @@ export default function App() {
     setRoom(newRoom);
     const params = new URLSearchParams(window.location.search);
     params.set('room', newRoom);
+    if (roomToken) params.set('token', roomToken);
     if (role === 'receiver') params.set('role', 'obs');
     window.history.replaceState(null, '', `?${params.toString()}`);
   };

@@ -233,7 +233,9 @@ export function ReceiverView({
   };
 
   const obsUrl = useMemo(() => {
-    return `${window.location.origin}/?role=obs&room=${encodeURIComponent(room)}`;
+    const token = new URLSearchParams(window.location.search).get('token') || '';
+    const tokenPart = token ? `&token=${encodeURIComponent(token)}` : '';
+    return `${window.location.origin}/?role=obs&room=${encodeURIComponent(room)}${tokenPart}`;
   }, [room]);
 
   const handleCopyLink = async () => {

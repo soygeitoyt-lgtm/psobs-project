@@ -73,7 +73,9 @@ export function SenderView({ room, onRoomChange, onSwitchToReceiver }: SenderVie
   // Calculate OBS Browser Source URL
   const obsUrl = useMemo(() => {
     const origin = window.location.origin;
-    return `${origin}/?role=obs&room=${encodeURIComponent(room)}`;
+    const token = new URLSearchParams(window.location.search).get('token') || '';
+    const tokenPart = token ? `&token=${encodeURIComponent(token)}` : '';
+    return `${origin}/?role=obs&room=${encodeURIComponent(room)}${tokenPart}`;
   }, [room]);
 
   const handleCopyObsLink = async () => {
