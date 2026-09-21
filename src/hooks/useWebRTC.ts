@@ -1,14 +1,14 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { AppRole, ConnectionStatus, SignalingMessage } from '../types';
+import { Peer, MediaConnection, DataConnection } from 'peerjs';
+import { AppRole, ConnectionStatus } from '../types';
 
-const RTC_CONFIG: RTCConfiguration = {
-  iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' },
-  ],
-  iceCandidatePoolSize: 6,
-};
+const ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun2.l.google.com:19302' },
+  { urls: 'stun:stun3.l.google.com:19302' },
+  { urls: 'stun:stun4.l.google.com:19302' },
+];
 
 interface UseWebRTCOptions {
   room: string;
@@ -32,322 +32,334 @@ export function useWebRTC({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [pingLatency, setPingLatency] = useState<number | null>(null);
 
-  const wsRef = useRef<WebSocket | null>(null);
-  const myClientIdRef = useRef<string>('');
-  // Map of peerId -> RTCPeerConnection
-  const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
-  const reconnectTimeoutRef = useRef<number | null>(null);
+  const peerRef = useRef<Peer | null>(null);
+  const mediaCallRef = useRef<MediaConnection | null>(null);
+  const dataConnRef = useRef<DataConnection | null>(null);
+  const retryIntervalRef = useRef<number | null>(null);
   const pingIntervalRef = useRef<number | null>(null);
   const localStreamRef = useRef<MediaStream | null>(localStream);
+  const isMutedRef = useRef<boolean>(!!isMuted);
+
+  const sanitizedRoom = room.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '') || 'default';
+  const receiverPeerId = `obsmic-recv-${sanitizedRoom}`;
 
   // Keep localStreamRef synced
   useEffect(() => {
     localStreamRef.current = localStream;
 
-    // If local stream changes (e.g. mic switch) while connections exist, update tracks
-    peerConnectionsRef.current.forEach((pc) => {
+    // Hot-replace track if audio stream changed during active call
+    if (mediaCallRef.current && mediaCallRef.current.peerConnection) {
+      const pc = mediaCallRef.current.peerConnection;
       const senders = pc.getSenders();
       const audioSender = senders.find((s) => s.track && s.track.kind === 'audio');
       const newTrack = localStream?.getAudioTracks()[0];
 
       if (audioSender && newTrack) {
         audioSender.replaceTrack(newTrack).catch((err) => {
-          console.warn('Error replacing audio track:', err);
+          console.warn('Error reemplazando pista de audio:', err);
         });
       } else if (!audioSender && newTrack && localStream) {
         pc.addTrack(newTrack, localStream);
       }
-    });
+    }
   }, [localStream]);
 
-  // Send Mute notification to peers
+  // Keep mute status synced over data channel
   useEffect(() => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
-        JSON.stringify({
-          type: 'mute-status',
-          room,
-          isMuted: !!isMuted,
-        })
-      );
+    isMutedRef.current = !!isMuted;
+    if (dataConnRef.current && dataConnRef.current.open) {
+      dataConnRef.current.send({
+        type: 'mute-status',
+        isMuted: !!isMuted,
+      });
     }
-  }, [isMuted, room]);
+  }, [isMuted]);
 
-  // Helper to send message via WS
-  const sendSignaling = useCallback((msg: SignalingMessage) => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(msg));
+  // Sender: Establish call and data connection to OBS receiver
+  const callReceiver = useCallback(() => {
+    if (!peerRef.current || peerRef.current.destroyed || peerRef.current.disconnected) {
+      return;
     }
-  }, []);
+    const currentStream = localStreamRef.current;
+    if (!currentStream) {
+      return;
+    }
 
-  // Cleanup a specific peer connection
-  const cleanupPeer = useCallback((peerId: string) => {
-    const pc = peerConnectionsRef.current.get(peerId);
-    if (pc) {
-      pc.ontrack = null;
-      pc.onicecandidate = null;
-      pc.onconnectionstatechange = null;
-      pc.close();
-      peerConnectionsRef.current.delete(peerId);
-    }
-    setConnectedPeersCount(peerConnectionsRef.current.size);
-    if (peerConnectionsRef.current.size === 0 && role === 'receiver') {
-      setRemoteStream(null);
-      setStatus('waiting-peer');
-    }
-  }, [role]);
-
-  // Create peer connection for a remote peer
-  const getOrCreatePeerConnection = useCallback(
-    (peerId: string): RTCPeerConnection => {
-      let pc = peerConnectionsRef.current.get(peerId);
-      if (pc && pc.signalingState !== 'closed') {
-        return pc;
+    // Close previous call if disconnected
+    if (mediaCallRef.current) {
+      try {
+        mediaCallRef.current.close();
+      } catch {
+        // ignore
       }
+      mediaCallRef.current = null;
+    }
 
-      pc = new RTCPeerConnection(RTC_CONFIG);
-      peerConnectionsRef.current.set(peerId, pc);
+    try {
+      setStatus('connecting-rtc');
 
-      pc.onicecandidate = (event) => {
-        if (event.candidate) {
-          sendSignaling({
-            type: 'ice-candidate',
-            room,
-            target: peerId,
-            candidate: event.candidate.toJSON(),
-          });
-        }
-      };
+      // 1. Audio Media Call
+      const call = peerRef.current.call(receiverPeerId, currentStream, {
+        metadata: {
+          deviceName: deviceName || 'Micrófono Móvil',
+        },
+      });
 
-      pc.onconnectionstatechange = () => {
-        const state = pc.connectionState;
-        if (state === 'connected') {
-          setStatus('connected');
-          setErrorMessage(null);
-        } else if (state === 'connecting') {
-          setStatus('connecting-rtc');
-        } else if (state === 'disconnected' || state === 'failed') {
-          console.warn(`WebRTC state for ${peerId}: ${state}`);
-          if (peerConnectionsRef.current.size <= 1) {
-            setStatus('waiting-peer');
-          }
-        } else if (state === 'closed') {
-          cleanupPeer(peerId);
-        }
-      };
+      mediaCallRef.current = call;
 
-      if (role === 'receiver') {
-        pc.ontrack = (event) => {
-          if (event.streams && event.streams[0]) {
-            setRemoteStream(event.streams[0]);
+      call.on('close', () => {
+        setConnectedPeersCount(0);
+        setStatus('waiting-peer');
+        mediaCallRef.current = null;
+      });
+
+      call.on('error', (err) => {
+        console.warn('Media call error:', err);
+      });
+
+      if (call.peerConnection) {
+        call.peerConnection.onconnectionstatechange = () => {
+          const state = call.peerConnection.connectionState;
+          if (state === 'connected') {
             setStatus('connected');
+            setConnectedPeersCount(1);
+            setErrorMessage(null);
+          } else if (state === 'disconnected' || state === 'failed') {
+            setStatus('waiting-peer');
+            setConnectedPeersCount(0);
           }
         };
       }
 
-      // If sender, attach audio track
-      if (role === 'sender' && localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach((track) => {
-          pc?.addTrack(track, localStreamRef.current!);
-        });
+      // 2. Data Connection (for mute status, ping, etc.)
+      if (dataConnRef.current) {
+        try {
+          dataConnRef.current.close();
+        } catch {
+          // ignore
+        }
       }
 
-      return pc;
-    },
-    [role, room, sendSignaling, cleanupPeer]
-  );
+      const conn = peerRef.current.connect(receiverPeerId, {
+        reliable: true,
+      });
+      dataConnRef.current = conn;
 
-  // Initiate offer as sender towards receiver
-  const initiateOffer = useCallback(
-    async (receiverPeerId: string) => {
+      conn.on('open', () => {
+        setStatus('connected');
+        setConnectedPeersCount(1);
+        conn.send({
+          type: 'mute-status',
+          isMuted: isMutedRef.current,
+        });
+      });
+
+      conn.on('data', (raw: unknown) => {
+        const data = raw as { type?: string; timestamp?: number };
+        if (data && data.type === 'pong' && data.timestamp) {
+          setPingLatency(Math.round(performance.now() - data.timestamp));
+        }
+      });
+
+      conn.on('close', () => {
+        dataConnRef.current = null;
+      });
+    } catch (err) {
+      console.warn('Error calling receiver:', err);
+    }
+  }, [receiverPeerId, deviceName]);
+
+  // Main Peer initialization
+  const initPeer = useCallback(() => {
+    // Cleanup existing peer
+    if (retryIntervalRef.current) {
+      clearInterval(retryIntervalRef.current);
+      retryIntervalRef.current = null;
+    }
+    if (pingIntervalRef.current) {
+      clearInterval(pingIntervalRef.current);
+      pingIntervalRef.current = null;
+    }
+    if (mediaCallRef.current) {
       try {
-        setStatus('connecting-rtc');
-        const pc = getOrCreatePeerConnection(receiverPeerId);
-
-        const offer = await pc.createOffer({
-          offerToReceiveAudio: false,
-          offerToReceiveVideo: false,
-        });
-        await pc.setLocalDescription(offer);
-
-        sendSignaling({
-          type: 'offer',
-          room,
-          target: receiverPeerId,
-          sdp: offer,
-        });
-      } catch (err: unknown) {
-        console.error('Error creating WebRTC offer:', err);
-        setErrorMessage('Error al iniciar conexión de audio.');
-      }
-    },
-    [getOrCreatePeerConnection, room, sendSignaling]
-  );
-
-  // Connect WebSocket and setup signaling handlers
-  const connectWebSocket = useCallback(() => {
-    if (!room) return;
-
-    if (wsRef.current) {
-      wsRef.current.close();
-      wsRef.current = null;
+        mediaCallRef.current.close();
+      } catch {}
+      mediaCallRef.current = null;
+    }
+    if (dataConnRef.current) {
+      try {
+        dataConnRef.current.close();
+      } catch {}
+      dataConnRef.current = null;
+    }
+    if (peerRef.current) {
+      try {
+        peerRef.current.destroy();
+      } catch {}
+      peerRef.current = null;
     }
 
     setStatus('connecting-ws');
     setErrorMessage(null);
 
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws`;
+    const peerId =
+      role === 'receiver'
+        ? receiverPeerId
+        : `obsmic-send-${sanitizedRoom}-${Math.random().toString(36).slice(2, 7)}`;
 
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
+    const peer = new Peer(peerId, {
+      config: {
+        iceServers: ICE_SERVERS,
+      },
+    });
+    peerRef.current = peer;
 
-    ws.onopen = () => {
-      setStatus('ws-ready');
-      ws.send(
-        JSON.stringify({
-          type: 'join',
-          room,
-          role,
-          deviceName: deviceName || (role === 'receiver' ? 'OBS Studio' : 'Micrófono Móvil'),
-        })
-      );
+    peer.on('open', (_id) => {
+      setStatus('waiting-peer');
+      setErrorMessage(null);
 
-      // Start ping loop for keepalive & latency check
-      if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
-      pingIntervalRef.current = window.setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) {
-          const t0 = performance.now();
-          ws.send(JSON.stringify({ type: 'ping', room }));
-          (ws as unknown as { _lastPingTime: number })._lastPingTime = t0;
-        }
-      }, 15000);
-    };
+      if (role === 'sender' && localStreamRef.current) {
+        callReceiver();
+      }
+    });
 
-    ws.onmessage = async (event) => {
-      try {
-        const data: SignalingMessage = JSON.parse(event.data);
+    // RECEIVER logic
+    if (role === 'receiver') {
+      peer.on('call', (incomingCall) => {
+        // Answer incoming audio stream from phone
+        incomingCall.answer();
+        mediaCallRef.current = incomingCall;
 
-        if (data.type === 'pong') {
-          const t0 = (ws as unknown as { _lastPingTime?: number })._lastPingTime;
-          if (t0) {
-            setPingLatency(Math.round(performance.now() - t0));
-          }
-          return;
-        }
+        incomingCall.on('stream', (stream) => {
+          setRemoteStream(stream);
+          setStatus('connected');
+          setConnectedPeersCount(1);
+          setErrorMessage(null);
+        });
 
-        if (data.type === 'joined') {
-          myClientIdRef.current = data.clientId || '';
+        incomingCall.on('close', () => {
+          setRemoteStream(null);
+          setConnectedPeersCount(0);
           setStatus('waiting-peer');
-          return;
-        }
+        });
 
-        if (data.type === 'peer-joined') {
-          const peerId = data.peerId;
-          const peerRole = data.role;
-
-          if (role === 'sender' && peerRole === 'receiver' && peerId) {
-            // OBS joined our room! Let's send an offer
-            await initiateOffer(peerId);
-          }
-          setConnectedPeersCount((c) => c + 1);
-          return;
-        }
-
-        if (data.type === 'peer-left') {
-          if (data.peerId) {
-            cleanupPeer(data.peerId);
-          }
-          return;
-        }
-
-        if (data.type === 'offer' && role === 'receiver' && data.sdp && data.from) {
-          const pc = getOrCreatePeerConnection(data.from);
-          await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
-
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-
-          sendSignaling({
-            type: 'answer',
-            room,
-            target: data.from,
-            sdp: answer,
-          });
-          return;
-        }
-
-        if (data.type === 'answer' && role === 'sender' && data.sdp && data.from) {
-          const pc = peerConnectionsRef.current.get(data.from);
-          if (pc) {
-            await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
-          }
-          return;
-        }
-
-        if (data.type === 'ice-candidate' && data.candidate && data.from) {
-          const pc = peerConnectionsRef.current.get(data.from);
-          if (pc) {
-            try {
-              await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-            } catch (iceErr) {
-              console.warn('Error adding ICE candidate:', iceErr);
+        if (incomingCall.peerConnection) {
+          incomingCall.peerConnection.onconnectionstatechange = () => {
+            const state = incomingCall.peerConnection.connectionState;
+            if (state === 'connected') {
+              setStatus('connected');
+            } else if (state === 'disconnected' || state === 'failed') {
+              setStatus('waiting-peer');
+              setConnectedPeersCount(0);
             }
+          };
+        }
+      });
+
+      peer.on('connection', (incomingConn) => {
+        dataConnRef.current = incomingConn;
+
+        incomingConn.on('data', (raw: unknown) => {
+          const data = raw as { type?: string; isMuted?: boolean; timestamp?: number };
+          if (!data) return;
+
+          if (data.type === 'mute-status') {
+            setRemoteMuted(!!data.isMuted);
+          } else if (data.type === 'ping') {
+            incomingConn.send({ type: 'pong', timestamp: data.timestamp });
           }
-          return;
-        }
+        });
 
-        if (data.type === 'mute-status') {
-          setRemoteMuted(!!data.isMuted);
-          return;
-        }
-
-        if (data.type === 'error') {
-          setErrorMessage(data.message || 'Error en el servidor de transmisión');
-        }
-      } catch (err: unknown) {
-        console.error('Error handling WebSocket message:', err);
-      }
-    };
-
-    ws.onerror = (err) => {
-      console.warn('WebSocket error:', err);
-      setStatus('error');
-      setErrorMessage('Conexión con el servidor interrumpida.');
-    };
-
-    ws.onclose = () => {
-      if (pingIntervalRef.current) {
-        clearInterval(pingIntervalRef.current);
-        pingIntervalRef.current = null;
-      }
-      setStatus('disconnected');
-    };
-  }, [room, role, deviceName, initiateOffer, getOrCreatePeerConnection, sendSignaling, cleanupPeer]);
-
-  // Connect on room change or mount
-  useEffect(() => {
-    if (room) {
-      connectWebSocket();
+        incomingConn.on('close', () => {
+          dataConnRef.current = null;
+        });
+      });
     }
-    return () => {
-      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
-      if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
-      if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
+
+    // Handle errors (e.g., peer unavailable while receiver hasn't opened yet)
+    peer.on('error', (err: { type?: string; message?: string }) => {
+      if (err.type === 'peer-unavailable') {
+        // Expected when OBS is not yet opened on PC
+        setStatus('waiting-peer');
+      } else if (err.type === 'unavailable-id') {
+        // If an old receiver instance was hanging on this ID, retry after slight delay
+        setErrorMessage('La sala ya tiene un receptor activo. Reconectando...');
+        setTimeout(() => {
+          if (peerRef.current && !peerRef.current.destroyed) {
+            initPeer();
+          }
+        }, 3000);
+      } else {
+        console.warn('PeerJS error:', err);
+        setErrorMessage(err.message || 'Error de conexión P2P');
       }
-      peerConnectionsRef.current.forEach((pc) => pc.close());
-      peerConnectionsRef.current.clear();
+    });
+
+    peer.on('disconnected', () => {
+      setStatus('disconnected');
+      try {
+        peer.reconnect();
+      } catch {}
+    });
+
+    // Start latency ping interval for sender
+    if (role === 'sender') {
+      pingIntervalRef.current = window.setInterval(() => {
+        if (dataConnRef.current && dataConnRef.current.open) {
+          dataConnRef.current.send({
+            type: 'ping',
+            timestamp: performance.now(),
+          });
+        }
+      }, 5000);
+
+      // Auto-retry calling OBS receiver periodically if capturing and not yet connected
+      retryIntervalRef.current = window.setInterval(() => {
+        if (
+          localStreamRef.current &&
+          (!mediaCallRef.current || !dataConnRef.current || !dataConnRef.current.open)
+        ) {
+          callReceiver();
+        }
+      }, 3000);
+    }
+  }, [role, receiverPeerId, sanitizedRoom, callReceiver]);
+
+  // When local stream becomes available (or changes) on sender, trigger call
+  useEffect(() => {
+    if (role === 'sender' && localStream) {
+      callReceiver();
+    }
+  }, [localStream, role, callReceiver]);
+
+  // Init on mount or room change
+  useEffect(() => {
+    initPeer();
+
+    return () => {
+      if (retryIntervalRef.current) clearInterval(retryIntervalRef.current);
+      if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
+      if (mediaCallRef.current) {
+        try {
+          mediaCallRef.current.close();
+        } catch {}
+      }
+      if (dataConnRef.current) {
+        try {
+          dataConnRef.current.close();
+        } catch {}
+      }
+      if (peerRef.current) {
+        try {
+          peerRef.current.destroy();
+        } catch {}
+      }
     };
-  }, [connectWebSocket, room]);
+  }, [initPeer]);
 
   const reconnect = useCallback(() => {
-    peerConnectionsRef.current.forEach((pc) => pc.close());
-    peerConnectionsRef.current.clear();
-    setRemoteStream(null);
-    connectWebSocket();
-  }, [connectWebSocket]);
+    initPeer();
+  }, [initPeer]);
 
   return {
     status,
