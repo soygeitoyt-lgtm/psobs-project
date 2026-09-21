@@ -54,15 +54,10 @@ export function useWebRTC({
   const isConnectingRef = useRef<boolean>(false);
 
   const sanitizedRoom = room.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '') || 'default';
-  // Token único por sala (en la URL) para que la ID del receptor no choque
-  // con la de otros usuarios en PeerJS Cloud (IDs globales compartidas).
-  const urlToken =
-    new URLSearchParams(window.location.search)
-      .get('token')
-      ?.trim()
-      .toLowerCase()
-      .replace(/[^a-z0-9_-]/g, '') || '';
-  const receiverPeerId = `psobs-recv-${urlToken || sanitizedRoom}`;
+  // ID del receptor derivada de la sala (compatible con enlaces antiguos).
+  // El prefijo + el sufijo aleatorio largo de la sala minimizan choques
+  // con otros usuarios en PeerJS Cloud.
+  const receiverPeerId = `psobs-recv-${sanitizedRoom}`;
 
   // Keep localStreamRef synced
   useEffect(() => {
